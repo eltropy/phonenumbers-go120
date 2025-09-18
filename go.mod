@@ -2,7 +2,10 @@ module github.com/eltropy/phonenumbers-go120
 
 go 1.20
 
+replace github.com/nyaruka/phonenumbers => ./
+
 require (
+	github.com/nyaruka/phonenumbers v0.0.0-00010101000000-000000000000
 	github.com/stretchr/testify v1.9.0
 	golang.org/x/exp v0.0.0-20240525044651-4c93da0ed11d
 	golang.org/x/text v0.15.0
