@@ -1,3 +1,5 @@
+Fork of nyaruka/phonenumbers v1.5.0 to retain Go 1.20 support, with up-to-date Google libphonenumber metadata.
+
 # ☎️ phonenumbers 
 [![Build Status](https://github.com/nyaruka/phonenumbers/workflows/CI/badge.svg)](https://github.com/nyaruka/phonenumbers/actions?query=workflow%3ACI) 
 [![codecov](https://codecov.io/gh/nyaruka/phonenumbers/branch/main/graph/badge.svg)](https://codecov.io/gh/nyaruka/phonenumbers)
