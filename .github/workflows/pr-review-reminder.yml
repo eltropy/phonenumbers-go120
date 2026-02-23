@@ -35,6 +35,7 @@ jobs:
         env:
           SLACK_PR_REVIEW_REMINDER_WEBHOOK_URL: ${{ secrets.SLACK_PR_REVIEW_REMINDER_WEBHOOK_URL }}
         with:
+          github-token: ${{ secrets.PR_GOVERNANCE_TOKEN || github.token }}
           script: |
             const fileSystem = require('fs');
             const pathModule = require('path');
@@ -45,7 +46,8 @@ jobs:
             const includedBaseBranchNameRegex =
               /^(main|master|develop|us-.*-release|US-.*-release|us-patch-.*-release|US-patch-.*-release|go120-v1\.5\.0)$/;
 
-            const minimumHoursBetweenReminders = 10 / 60;
+            const minimumReminderIntervalMinutes = 10;
+            const minimumHoursBetweenReminders = minimumReminderIntervalMinutes / 60;
             const reminderCommentMarker = '<!-- pr-review-reminder -->';
 
             const excludedGitHubLoginsFromSlackChannelMentions = new Set([
@@ -184,13 +186,15 @@ jobs:
             }) {
               const slackWebhookUrl = process.env.SLACK_PR_REVIEW_REMINDER_WEBHOOK_URL;
               if (typeof slackWebhookUrl !== 'string' || slackWebhookUrl.trim().length === 0) {
-                return;
+                core.info('Slack webhook secret not configured. Skipping Slack notification.');
+                return false;
               }
 
               const slackMentionResolution = buildSlackMentionResolution(pendingAssigneeGitHubLogins);
 
               if (slackMentionResolution.eligibleAssigneeGitHubLogins.length === 0) {
-                return;
+                core.info(`No eligible assignees to mention on Slack for PR #${pullRequestNumber}.`);
+                return false;
               }
 
               const slackMentionsLine =
@@ -258,11 +262,47 @@ jobs:
                   core.warning(
                     `Slack webhook request failed for PR #${pullRequestNumber}: ${slackResponse.status} ${slackResponse.statusText} ${slackResponseBodyText}`
                   );
+                  return false;
                 }
+
+                core.info(`Posted Slack reminder for PR #${pullRequestNumber}.`);
+                return true;
               } catch (caughtError) {
                 core.warning(
                   `Slack webhook notification failed for PR #${pullRequestNumber}: ${caughtError?.message || String(caughtError)}`
                 );
+                return false;
+              }
+            }
+
+            async function createReviewReminderComment({
+              pullRequestNumber,
+              pullRequestTitle,
+              pullRequestUrl,
+              mentionListText,
+            }) {
+              const reminderCommentBody =
+                `${reminderCommentMarker}\n` +
+                `**Review Reminder**\n\n` +
+                `${mentionListText}\n\n` +
+                `Please review or comment on this pull request:\n` +
+                `**#${pullRequestNumber} — ${pullRequestTitle}**\n` +
+                `${pullRequestUrl}\n\n` +
+                `_You will be reminded every ${minimumReminderIntervalMinutes} minutes until you leave a review or comment._`;
+
+              try {
+                await github.rest.issues.createComment({
+                  owner: githubRepositoryOwnerLogin,
+                  repo: githubRepositoryName,
+                  issue_number: pullRequestNumber,
+                  body: reminderCommentBody,
+                });
+                return true;
+              } catch (caughtError) {
+                core.warning(
+                  `Failed to create reminder comment for PR #${pullRequestNumber}: ${caughtError?.message || String(caughtError)}`
+                );
+                return false;
               }
             }
 
@@ -328,27 +368,23 @@ jobs:
                   priorReminderComments[0].created_at
                 );
 
-                if (elapsedHoursSinceLastReminder < minimumHoursBetweenReminders) continue;
+                if (elapsedHoursSinceLastReminder < minimumHoursBetweenReminders) {
+                  core.info(
+                    `Skipping PR #${pullRequestNumber}; last reminder sent ${elapsedHoursSinceLastReminder.toFixed(2)}h ago.`
+                  );
+                  continue;
+                }
               }
 
               const mentionListText = assigneesPendingAction
                 .map((githubLogin) => `@${githubLogin}`)
                 .join(' ');
 
-              const reminderCommentBody =
-                `${reminderCommentMarker}\n` +
-                `**Review Reminder**\n\n` +
-                `${mentionListText}\n\n` +
-                `Please review or comment on this pull request:\n` +
-                `**#${pullRequestNumber} — ${pullRequestTitle}**\n` +
-                `${pullRequestUrl}\n\n` +
-                `_You will be reminded every 6 hours until you leave a review or comment._`;
-
-              await github.rest.issues.createComment({
-                owner: githubRepositoryOwnerLogin,
-                repo: githubRepositoryName,
-                issue_number: pullRequestNumber,
-                body: reminderCommentBody,
+              await createReviewReminderComment({
+                pullRequestNumber,
+                pullRequestTitle,
+                pullRequestUrl,
+                mentionListText,
               });
 
               await postSlackChannelReminderIfConfigured({
