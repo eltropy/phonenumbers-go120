@@ -27,13 +27,9 @@ jobs:
     steps:
       - name: Enforce 2-10 Assignees And Draft When Invalid
         uses: actions/github-script@v7
-        env:
-          PR_GOVERNANCE_TOKEN: ${{ secrets.PR_GOVERNANCE_TOKEN }}
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ secrets.PR_GOVERNANCE_TOKEN || github.token }}
           script: |
-            const { getOctokit } = require('@actions/github');
-
             const pullRequestPayload = context.payload.pull_request;
             if (!pullRequestPayload) {
               core.setFailed('No pull_request payload found.');
@@ -62,16 +58,6 @@ jobs:
               'unassigned',
               'ready_for_review',
             ]);
-
-            const personalGovernanceToken =
-              typeof process.env.PR_GOVERNANCE_TOKEN === 'string'
-                ? process.env.PR_GOVERNANCE_TOKEN.trim()
-                : '';
-
-            const draftConversionGitHubClient =
-              personalGovernanceToken.length > 0 ? getOctokit(personalGovernanceToken) : github;
-
-            let shouldSkipGovernanceLabelManagement = false;
 
             const assignedGitHubLogins = (pullRequestPayload.assignees || [])
               .map((assignee) => assignee?.login)
@@ -107,8 +93,6 @@ jobs:
             const hadNeedsAssigneesLabelBeforeRun = currentLabelNamesBeforeRun.includes(governanceLabelName);
 
             async function ensureGovernanceLabelExists() {
-              if (shouldSkipGovernanceLabelManagement) return;
-
               try {
                 await github.rest.issues.getLabel({
                   owner: githubRepositoryOwnerLogin,
@@ -117,38 +101,13 @@ jobs:
                 });
               } catch (caughtError) {
                 if (caughtError?.status === 404) {
-                  try {
-                    await github.rest.issues.createLabel({
-                      owner: githubRepositoryOwnerLogin,
-                      repo: githubRepositoryName,
-                      name: governanceLabelName,
-                      color: governanceLabelColor,
-                      description: governanceLabelDescription,
-                    });
-                    return;
-                  } catch (createLabelError) {
-                    const createLabelErrorMessage =
-                      createLabelError?.message || String(createLabelError);
-
-                    if (createLabelError?.status === 403) {
-                      shouldSkipGovernanceLabelManagement = true;
-                      core.warning(
-                        `Skipping governance label management due to insufficient permissions to create labels: ${createLabelErrorMessage}`
-                      );
-                      return;
-                    }
-
-                    throw createLabelError;
-                  }
-                }
-
-                if (caughtError?.status === 403) {
-                  shouldSkipGovernanceLabelManagement = true;
-                  core.warning(
-                    `Skipping governance label management due to insufficient permissions to read labels: ${
-                      caughtError?.message || String(caughtError)
-                    }`
-                  );
+                  await github.rest.issues.createLabel({
+                    owner: githubRepositoryOwnerLogin,
+                    repo: githubRepositoryName,
+                    name: governanceLabelName,
+                    color: governanceLabelColor,
+                    description: governanceLabelDescription,
+                  });
                   return;
                 }
 
@@ -157,7 +116,6 @@ jobs:
             }
 
             async function addGovernanceLabelIfMissing() {
-              if (shouldSkipGovernanceLabelManagement) return;
               if (hadNeedsAssigneesLabelBeforeRun) return;
 
               try {
@@ -168,10 +126,6 @@ jobs:
                   labels: [governanceLabelName],
                 });
               } catch (caughtError) {
-                if (caughtError?.status === 403) {
-                  shouldSkipGovernanceLabelManagement = true;
-                }
-
                 core.warning(
                   `Failed to add label "${governanceLabelName}": ${caughtError?.message || String(caughtError)}`
                 );
@@ -179,7 +133,6 @@ jobs:
             }
 
             async function removeGovernanceLabelIfPresent() {
-              if (shouldSkipGovernanceLabelManagement) return;
               if (!hadNeedsAssigneesLabelBeforeRun) return;
 
               try {
@@ -190,10 +143,6 @@ jobs:
                   name: governanceLabelName,
                 });
               } catch (caughtError) {
-                if (caughtError?.status === 403) {
-                  shouldSkipGovernanceLabelManagement = true;
-                }
-
                 core.warning(
                   `Failed to remove label "${governanceLabelName}": ${caughtError?.message || String(caughtError)}`
                 );
@@ -269,7 +218,7 @@ jobs:
               }
 
               try {
-                await draftConversionGitHubClient.graphql(
+                await github.graphql(
                   `
                   mutation ConvertPullRequestToDraft($pullRequestId: ID!) {
                     convertPullRequestToDraft(input: { pullRequestId: $pullRequestId }) {
