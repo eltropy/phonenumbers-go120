@@ -1,0 +1,298 @@
+name: PR Assignee Gate
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - ready_for_review
+      - reopened
+      - synchronize
+      - assigned
+      - unassigned
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-assignee-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate_assignees_and_manage_draft_state:
+    name: Validate Assignees And Manage Draft State
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce 2-10 Assignees And Draft When Invalid
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PR_GOVERNANCE_TOKEN || github.token }}
+          script: |
+            const pullRequestPayload = context.payload.pull_request;
+            if (!pullRequestPayload) {
+              core.setFailed('No pull_request payload found.');
+              return;
+            }
+
+            const githubRepositoryOwnerLogin = context.repo.owner;
+            const githubRepositoryName = context.repo.repo;
+            const pullRequestNumber = pullRequestPayload.number;
+
+            const minimumRequiredAssigneesCount = 2;
+            const maximumAllowedAssigneesCount = 10;
+
+            const governanceLabelName = 'needs-assignees';
+            const governanceLabelColor = 'd73a4a';
+            const governanceLabelDescription = 'PR requires 2-10 assignees';
+
+            const governanceCommentMarker = '<!-- pr-assignee-gate -->';
+
+            const pullRequestAction = typeof context.payload.action === 'string' ? context.payload.action : '';
+
+            const actionsThatShouldCreateInvalidComments = new Set([
+              'opened',
+              'reopened',
+              'assigned',
+              'unassigned',
+              'ready_for_review',
+            ]);
+
+            const assignedGitHubLogins = (pullRequestPayload.assignees || [])
+              .map((assignee) => assignee?.login)
+              .filter((login) => typeof login === 'string' && login.trim().length > 0);
+
+            const assigneeCount = assignedGitHubLogins.length;
+
+            const isAssigneeCountValid =
+              assigneeCount >= minimumRequiredAssigneesCount &&
+              assigneeCount <= maximumAllowedAssigneesCount;
+
+            async function listCurrentIssueLabelNames() {
+              try {
+                const { data: labelPayloads } = await github.rest.issues.listLabelsOnIssue({
+                  owner: githubRepositoryOwnerLogin,
+                  repo: githubRepositoryName,
+                  issue_number: pullRequestNumber,
+                  per_page: 100,
+                });
+
+                return (Array.isArray(labelPayloads) ? labelPayloads : [])
+                  .map((labelPayload) => labelPayload?.name)
+                  .filter((labelName) => typeof labelName === 'string' && labelName.trim().length > 0);
+              } catch (caughtError) {
+                core.warning(
+                  `Failed to list current labels: ${caughtError?.message || String(caughtError)}`
+                );
+                return [];
+              }
+            }
+
+            const currentLabelNamesBeforeRun = await listCurrentIssueLabelNames();
+            const hadNeedsAssigneesLabelBeforeRun = currentLabelNamesBeforeRun.includes(governanceLabelName);
+
+            async function ensureGovernanceLabelExists() {
+              try {
+                await github.rest.issues.getLabel({
+                  owner: githubRepositoryOwnerLogin,
+                  repo: githubRepositoryName,
+                  name: governanceLabelName,
+                });
+              } catch (caughtError) {
+                if (caughtError?.status === 404) {
+                  await github.rest.issues.createLabel({
+                    owner: githubRepositoryOwnerLogin,
+                    repo: githubRepositoryName,
+                    name: governanceLabelName,
+                    color: governanceLabelColor,
+                    description: governanceLabelDescription,
+                  });
+                  return;
+                }
+
+                throw caughtError;
+              }
+            }
+
+            async function addGovernanceLabelIfMissing() {
+              if (hadNeedsAssigneesLabelBeforeRun) return;
+
+              try {
+                await github.rest.issues.addLabels({
+                  owner: githubRepositoryOwnerLogin,
+                  repo: githubRepositoryName,
+                  issue_number: pullRequestNumber,
+                  labels: [governanceLabelName],
+                });
+              } catch (caughtError) {
+                core.warning(
+                  `Failed to add label "${governanceLabelName}": ${caughtError?.message || String(caughtError)}`
+                );
+              }
+            }
+
+            async function removeGovernanceLabelIfPresent() {
+              if (!hadNeedsAssigneesLabelBeforeRun) return;
+
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: githubRepositoryOwnerLogin,
+                  repo: githubRepositoryName,
+                  issue_number: pullRequestNumber,
+                  name: governanceLabelName,
+                });
+              } catch (caughtError) {
+                core.warning(
+                  `Failed to remove label "${governanceLabelName}": ${caughtError?.message || String(caughtError)}`
+                );
+              }
+            }
+
+            async function createGovernanceComment(governanceCommentBodyText) {
+              const finalCommentBody = `${governanceCommentMarker}\n${governanceCommentBodyText}`;
+
+              try {
+                await github.rest.issues.createComment({
+                  owner: githubRepositoryOwnerLogin,
+                  repo: githubRepositoryName,
+                  issue_number: pullRequestNumber,
+                  body: finalCommentBody,
+                });
+              } catch (caughtError) {
+                core.warning(
+                  `Failed to create governance comment: ${caughtError?.message || String(caughtError)}`
+                );
+              }
+            }
+
+            async function resolvePullRequestNodeId() {
+              const nodeIdFromPayload = pullRequestPayload?.node_id;
+              if (typeof nodeIdFromPayload === 'string' && nodeIdFromPayload.trim().length > 0) {
+                return nodeIdFromPayload;
+              }
+
+              try {
+                const graphQlQueryResult = await github.graphql(
+                  `
+                  query ResolvePullRequestNodeId($owner: String!, $repo: String!, $number: Int!) {
+                    repository(owner: $owner, name: $repo) {
+                      pullRequest(number: $number) {
+                        id
+                      }
+                    }
+                  }
+                  `,
+                  {
+                    owner: githubRepositoryOwnerLogin,
+                    repo: githubRepositoryName,
+                    number: pullRequestNumber,
+                  }
+                );
+
+                const resolvedPullRequestNodeId = graphQlQueryResult?.repository?.pullRequest?.id;
+                return typeof resolvedPullRequestNodeId === 'string' &&
+                  resolvedPullRequestNodeId.trim().length > 0
+                  ? resolvedPullRequestNodeId
+                  : null;
+              } catch (caughtError) {
+                core.warning(
+                  `Failed to resolve PR node id: ${caughtError?.message || String(caughtError)}`
+                );
+                return null;
+              }
+            }
+
+            async function tryConvertPullRequestToDraftIfNeeded() {
+              if (pullRequestPayload.draft) {
+                return { didAttempt: false, didSucceed: true, failureMessage: '' };
+              }
+
+              const pullRequestNodeId = await resolvePullRequestNodeId();
+              if (!pullRequestNodeId) {
+                return {
+                  didAttempt: true,
+                  didSucceed: false,
+                  failureMessage: 'Unable to resolve pull request node id.',
+                };
+              }
+
+              try {
+                await github.graphql(
+                  `
+                  mutation ConvertPullRequestToDraft($pullRequestId: ID!) {
+                    convertPullRequestToDraft(input: { pullRequestId: $pullRequestId }) {
+                      pullRequest {
+                        isDraft
+                      }
+                    }
+                  }
+                  `,
+                  { pullRequestId: pullRequestNodeId }
+                );
+
+                return { didAttempt: true, didSucceed: true, failureMessage: '' };
+              } catch (caughtError) {
+                const conversionFailureMessage = caughtError?.message || String(caughtError);
+                core.warning(
+                  `Convert-to-draft failed for PR #${pullRequestNumber}: ${conversionFailureMessage}`
+                );
+                return {
+                  didAttempt: true,
+                  didSucceed: false,
+                  failureMessage: conversionFailureMessage,
+                };
+              }
+            }
+
+            await ensureGovernanceLabelExists();
+
+            if (!isAssigneeCountValid) {
+              const pullRequestDraftConversionResult = await tryConvertPullRequestToDraftIfNeeded();
+              await addGovernanceLabelIfMissing();
+
+              const shouldCreateInvalidComment = actionsThatShouldCreateInvalidComments.has(
+                pullRequestAction
+              );
+
+              if (shouldCreateInvalidComment) {
+                const assigneeListText = assignedGitHubLogins.length
+                  ? assignedGitHubLogins.map((login) => `\`${login}\``).join(', ')
+                  : '_none_';
+
+                const conversionStatusText = pullRequestDraftConversionResult.didAttempt
+                  ? pullRequestDraftConversionResult.didSucceed
+                    ? 'Draft status: converted automatically.'
+                    : 'Draft status: unable to convert automatically (see Actions logs). Please convert to Draft manually.'
+                  : 'Draft status: already Draft.';
+
+                await createGovernanceComment(
+                  `**Assignee governance**\n\n` +
+                    `This PR is **not ready for review** because it currently has **${assigneeCount}** assignee(s).\n\n` +
+                    `**Requirement:** ${minimumRequiredAssigneesCount}-${maximumAllowedAssigneesCount} assignees.\n` +
+                    `**Current assignees:** ${assigneeListText}\n\n` +
+                    `${conversionStatusText}\n\n` +
+                    `Once assignees are fixed, mark the PR **Ready for review**.`
+                );
+              }
+
+              core.setFailed(
+                `Assignee count must be between ${minimumRequiredAssigneesCount} and ${maximumAllowedAssigneesCount} (current: ${assigneeCount}).`
+              );
+              return;
+            }
+
+            await removeGovernanceLabelIfPresent();
+
+            if (hadNeedsAssigneesLabelBeforeRun) {
+              const assigneeListText = assignedGitHubLogins.length
+                ? assignedGitHubLogins.map((login) => `\`${login}\``).join(', ')
+                : '_none_';
+
+              await createGovernanceComment(
+                `**Assignee governance resolved**\n\n` +
+                  `Assignee requirement is now satisfied.\n\n` +
+                  `**Assignees (${assigneeCount}):** ${assigneeListText}\n\n` +
+                  `If this PR is in Draft, you can now mark it **Ready for review**.`
+              );
+            }

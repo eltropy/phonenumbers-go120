@@ -1,0 +1,399 @@
+name: PR Review Reminder
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+      - assigned
+      - unassigned
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+concurrency:
+  group: pr-review-reminder
+  cancel-in-progress: false
+
+jobs:
+  remind_assignees_without_reviews:
+    name: Remind Assignees Without Reviews
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Identify Open PRs And Notify Assignees Pending Review
+        uses: actions/github-script@v7
+        env:
+          SLACK_PR_REVIEW_REMINDER_WEBHOOK_URL: ${{ secrets.SLACK_PR_REVIEW_REMINDER_WEBHOOK_URL }}
+        with:
+          github-token: ${{ secrets.PR_GOVERNANCE_TOKEN || github.token }}
+          script: |
+            const fileSystem = require('fs');
+            const pathModule = require('path');
+
+            const githubRepositoryOwnerLogin = context.repo.owner;
+            const githubRepositoryName = context.repo.repo;
+
+            const includedBaseBranchNameRegex =
+              /^(main|master|develop|us-.*-release|US-.*-release|us-patch-.*-release|US-patch-.*-release|go120-v1\.5\.0)$/;
+
+            const minimumReminderIntervalMinutes = 10;
+            const minimumHoursBetweenReminders = minimumReminderIntervalMinutes / 60;
+            const reminderCommentMarker = '<!-- pr-review-reminder -->';
+
+            const excludedGitHubLoginsFromSlackChannelMentions = new Set([
+              'saralaEltropy',
+            ]);
+
+            function readGitHubToSlackUserMapping() {
+              try {
+                const mappingFileAbsolutePath = pathModule.join(
+                  process.env.GITHUB_WORKSPACE || process.cwd(),
+                  '.github',
+                  'gh-to-slack.json'
+                );
+
+                const mappingFileContent = fileSystem.readFileSync(mappingFileAbsolutePath, 'utf8');
+                const parsedMapping = JSON.parse(mappingFileContent);
+
+                if (!parsedMapping || typeof parsedMapping !== 'object' || Array.isArray(parsedMapping)) {
+                  core.warning('Invalid .github/gh-to-slack.json format. Slack tagging will be skipped.');
+                  return {};
+                }
+
+                return parsedMapping;
+              } catch (caughtError) {
+                core.warning(
+                  `Unable to read .github/gh-to-slack.json. Slack tagging will be skipped: ${caughtError?.message || String(caughtError)}`
+                );
+                return {};
+              }
+            }
+
+            const githubToSlackUserIdMap = readGitHubToSlackUserMapping();
+
+            async function listAllOpenPullRequests() {
+              const aggregatedPullRequests = [];
+              let pageNumber = 1;
+
+              while (true) {
+                const { data: pullRequestsPage } = await github.rest.pulls.list({
+                  owner: githubRepositoryOwnerLogin,
+                  repo: githubRepositoryName,
+                  state: 'open',
+                  per_page: 100,
+                  page: pageNumber,
+                });
+
+                if (!Array.isArray(pullRequestsPage) || pullRequestsPage.length === 0) break;
+
+                aggregatedPullRequests.push(...pullRequestsPage);
+                pageNumber += 1;
+              }
+
+              return aggregatedPullRequests;
+            }
+
+            async function listAllReviewsForPullRequest(pullRequestNumber) {
+              const aggregatedReviews = [];
+              let pageNumber = 1;
+
+              while (true) {
+                const { data: reviewsPage } = await github.rest.pulls.listReviews({
+                  owner: githubRepositoryOwnerLogin,
+                  repo: githubRepositoryName,
+                  pull_number: pullRequestNumber,
+                  per_page: 100,
+                  page: pageNumber,
+                });
+
+                if (!Array.isArray(reviewsPage) || reviewsPage.length === 0) break;
+
+                aggregatedReviews.push(...reviewsPage);
+                pageNumber += 1;
+              }
+
+              return aggregatedReviews;
+            }
+
+            async function listAllIssueCommentsForPullRequest(pullRequestNumber) {
+              const aggregatedComments = [];
+              let pageNumber = 1;
+
+              while (true) {
+                const { data: commentsPage } = await github.rest.issues.listComments({
+                  owner: githubRepositoryOwnerLogin,
+                  repo: githubRepositoryName,
+                  issue_number: pullRequestNumber,
+                  per_page: 100,
+                  page: pageNumber,
+                });
+
+                if (!Array.isArray(commentsPage) || commentsPage.length === 0) break;
+
+                aggregatedComments.push(...commentsPage);
+                pageNumber += 1;
+              }
+
+              return aggregatedComments;
+            }
+
+            function calculateElapsedHoursSinceIsoString(isoString) {
+              const parsedTimestamp = new Date(isoString).getTime();
+              if (!Number.isFinite(parsedTimestamp)) return Number.POSITIVE_INFINITY;
+              return (Date.now() - parsedTimestamp) / 3600000;
+            }
+
+            function buildSlackMentionResolution(pendingAssigneeGitHubLogins) {
+              const eligibleAssigneeGitHubLogins = pendingAssigneeGitHubLogins.filter(
+                (githubLogin) => !excludedGitHubLoginsFromSlackChannelMentions.has(githubLogin)
+              );
+
+              const slackMentionTokens = [];
+              const unmappedEligibleGitHubLogins = [];
+
+              for (const githubLogin of eligibleAssigneeGitHubLogins) {
+                const mappedSlackMemberId = githubToSlackUserIdMap[githubLogin];
+                if (typeof mappedSlackMemberId === 'string' && mappedSlackMemberId.trim().length > 0) {
+                  slackMentionTokens.push(`<@${mappedSlackMemberId.trim()}>`);
+                } else {
+                  unmappedEligibleGitHubLogins.push(githubLogin);
+                }
+              }
+
+              return {
+                eligibleAssigneeGitHubLogins,
+                slackMentionTokens,
+                unmappedEligibleGitHubLogins,
+              };
+            }
+
+            async function postSlackChannelReminderIfConfigured({
+              pullRequestNumber,
+              pullRequestTitle,
+              pullRequestUrl,
+              baseBranchName,
+              pendingAssigneeGitHubLogins,
+            }) {
+              const slackWebhookUrl = process.env.SLACK_PR_REVIEW_REMINDER_WEBHOOK_URL;
+              if (typeof slackWebhookUrl !== 'string' || slackWebhookUrl.trim().length === 0) {
+                core.info('Slack webhook secret not configured. Skipping Slack notification.');
+                return false;
+              }
+
+              const slackMentionResolution = buildSlackMentionResolution(pendingAssigneeGitHubLogins);
+
+              if (slackMentionResolution.eligibleAssigneeGitHubLogins.length === 0) {
+                core.info(`No eligible assignees to mention on Slack for PR #${pullRequestNumber}.`);
+                return false;
+              }
+
+              const slackMentionsLine =
+                slackMentionResolution.slackMentionTokens.length > 0
+                  ? slackMentionResolution.slackMentionTokens.join(' ')
+                  : 'No mapped Slack members for pending assignees.';
+
+              const unmappedAssigneeLine =
+                slackMentionResolution.unmappedEligibleGitHubLogins.length > 0
+                  ? `\nUnmapped GitHub assignees: ${slackMentionResolution.unmappedEligibleGitHubLogins
+                      .map((githubLogin) => `@${githubLogin}`)
+                      .join(', ')}`
+                  : '';
+
+              const excludedAssigneeLogins = pendingAssigneeGitHubLogins.filter((githubLogin) =>
+                excludedGitHubLoginsFromSlackChannelMentions.has(githubLogin)
+              );
+
+              const excludedAssigneeLine =
+                excludedAssigneeLogins.length > 0
+                  ? `\nExcluded from Slack mention: ${excludedAssigneeLogins
+                      .map((githubLogin) => `@${githubLogin}`)
+                      .join(', ')}`
+                  : '';
+
+              const slackMessageText =
+                `Review reminder for PR #${pullRequestNumber}: ${pullRequestTitle}\n` +
+                `${pullRequestUrl}`;
+
+              const slackWebhookPayload = {
+                text: slackMessageText,
+                blocks: [
+                  {
+                    type: 'section',
+                    text: {
+                      type: 'mrkdwn',
+                      text:
+                        `*Review Reminder*\n` +
+                        `*PR:* <${pullRequestUrl}|#${pullRequestNumber} — ${pullRequestTitle}>\n` +
+                        `*Base branch:* \`${baseBranchName}\`\n` +
+                        `*Pending assignees:* ${pendingAssigneeGitHubLogins
+                          .map((githubLogin) => `@${githubLogin}`)
+                          .join(', ')}`,
+                    },
+                  },
+                  {
+                    type: 'section',
+                    text: {
+                      type: 'mrkdwn',
+                      text: `*Slack mentions:* ${slackMentionsLine}${unmappedAssigneeLine}${excludedAssigneeLine}`,
+                    },
+                  },
+                ],
+              };
+
+              try {
+                const slackResponse = await fetch(slackWebhookUrl, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(slackWebhookPayload),
+                });
+
+                if (!slackResponse.ok) {
+                  const slackResponseBodyText = await slackResponse.text();
+                  core.warning(
+                    `Slack webhook request failed for PR #${pullRequestNumber}: ${slackResponse.status} ${slackResponse.statusText} ${slackResponseBodyText}`
+                  );
+                  return false;
+                }
+
+                core.info(`Posted Slack reminder for PR #${pullRequestNumber}.`);
+                return true;
+              } catch (caughtError) {
+                core.warning(
+                  `Slack webhook notification failed for PR #${pullRequestNumber}: ${caughtError?.message || String(caughtError)}`
+                );
+                return false;
+              }
+            }
+
+            async function createReviewReminderComment({
+              pullRequestNumber,
+              pullRequestTitle,
+              pullRequestUrl,
+              mentionListText,
+            }) {
+              const reminderCommentBody =
+                `${reminderCommentMarker}\n` +
+                `**Review Reminder**\n\n` +
+                `${mentionListText}\n\n` +
+                `Please review or comment on this pull request:\n` +
+                `**#${pullRequestNumber} — ${pullRequestTitle}**\n` +
+                `${pullRequestUrl}\n\n` +
+                `_You will be reminded every ${minimumReminderIntervalMinutes} minutes until you leave a review or comment._`;
+
+              try {
+                await github.rest.issues.createComment({
+                  owner: githubRepositoryOwnerLogin,
+                  repo: githubRepositoryName,
+                  issue_number: pullRequestNumber,
+                  body: reminderCommentBody,
+                });
+                return true;
+              } catch (caughtError) {
+                core.warning(
+                  `Failed to create reminder comment for PR #${pullRequestNumber}: ${caughtError?.message || String(caughtError)}`
+                );
+                return false;
+              }
+            }
+
+            const openPullRequests = await listAllOpenPullRequests();
+
+            for (const pullRequestPayload of openPullRequests) {
+              const baseBranchName = pullRequestPayload?.base?.ref || '';
+              if (!includedBaseBranchNameRegex.test(baseBranchName)) continue;
+
+              if (pullRequestPayload?.draft) continue;
+
+              const pullRequestNumber = pullRequestPayload.number;
+              const pullRequestUrl = pullRequestPayload.html_url || '';
+              const pullRequestTitle = pullRequestPayload.title || '';
+              const pullRequestAuthorLogin = pullRequestPayload?.user?.login || null;
+
+              const assignedGitHubLogins = (pullRequestPayload.assignees || [])
+                .map((assignee) => assignee?.login)
+                .filter((login) => typeof login === 'string' && login.trim().length > 0);
+
+              const nonAuthorAssigneeLogins = pullRequestAuthorLogin
+                ? assignedGitHubLogins.filter((login) => login !== pullRequestAuthorLogin)
+                : assignedGitHubLogins;
+
+              if (nonAuthorAssigneeLogins.length === 0) continue;
+
+              const allReviews = await listAllReviewsForPullRequest(pullRequestNumber);
+              const reviewAuthorLogins = allReviews
+                .map((reviewPayload) => reviewPayload?.user?.login)
+                .filter((login) => typeof login === 'string' && login.trim().length > 0);
+
+              const allIssueComments = await listAllIssueCommentsForPullRequest(pullRequestNumber);
+              const issueCommentAuthorLogins = allIssueComments
+                .map((issueCommentPayload) => issueCommentPayload?.user?.login)
+                .filter((login) => typeof login === 'string' && login.trim().length > 0);
+
+              const assigneeParticipationLoginSet = new Set([
+                ...reviewAuthorLogins,
+                ...issueCommentAuthorLogins,
+              ]);
+
+              const assigneesPendingAction = nonAuthorAssigneeLogins.filter(
+                (githubLogin) => !assigneeParticipationLoginSet.has(githubLogin)
+              );
+
+              if (assigneesPendingAction.length === 0) continue;
+
+              const priorReminderComments = allIssueComments
+                .filter(
+                  (issueCommentPayload) =>
+                    issueCommentPayload?.user?.type === 'Bot' &&
+                    typeof issueCommentPayload.body === 'string' &&
+                    issueCommentPayload.body.includes(reminderCommentMarker)
+                )
+                .sort(
+                  (leftIssueCommentPayload, rightIssueCommentPayload) =>
+                    new Date(rightIssueCommentPayload.created_at).getTime() -
+                    new Date(leftIssueCommentPayload.created_at).getTime()
+                );
+
+              if (priorReminderComments.length > 0) {
+                const elapsedHoursSinceLastReminder = calculateElapsedHoursSinceIsoString(
+                  priorReminderComments[0].created_at
+                );
+
+                if (elapsedHoursSinceLastReminder < minimumHoursBetweenReminders) {
+                  core.info(
+                    `Skipping PR #${pullRequestNumber}; last reminder sent ${elapsedHoursSinceLastReminder.toFixed(2)}h ago.`
+                  );
+                  continue;
+                }
+              }
+
+              const mentionListText = assigneesPendingAction
+                .map((githubLogin) => `@${githubLogin}`)
+                .join(' ');
+
+              await createReviewReminderComment({
+                pullRequestNumber,
+                pullRequestTitle,
+                pullRequestUrl,
+                mentionListText,
+              });
+
+              await postSlackChannelReminderIfConfigured({
+                pullRequestNumber,
+                pullRequestTitle,
+                pullRequestUrl,
+                baseBranchName,
+                pendingAssigneeGitHubLogins: assigneesPendingAction,
+              });
+
+              await new Promise((resolve) => setTimeout(resolve, 500));
+            }
